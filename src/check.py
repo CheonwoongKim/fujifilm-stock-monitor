@@ -1,8 +1,9 @@
-"""Fujifilm Korea product stock checker.
+"""Fujifilm Korea product stock checker — variant aware (Silver/Black).
 
-Loads the product page with a headless browser, classifies stock state,
-compares against the previous state, and triggers a Telegram alert on the
-out-of-stock -> in-stock transition.
+Loads the product page with a headless browser, reads each color variant's
+`data-soldout` flag, and triggers a Telegram alert whenever a variant
+transitions from sold out to in stock. The alert names exactly which color
+is available so the user can jump straight to checkout.
 
 Environment variables:
     PRODUCT_URL          target product page (default: X100VI page id 1330)
@@ -18,7 +19,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,9 +29,6 @@ import notify
 
 DEFAULT_URL = "https://www.fujifilm-korea.co.kr/products/id/1330"
 DEFAULT_STATE_PATH = "state.json"
-
-OUT_OF_STOCK_KEYWORDS = ("품절", "일시품절", "재입고", "SOLD OUT", "Sold Out")
-IN_STOCK_BUTTON_KEYWORDS = ("구매하기", "바로구매", "장바구니")
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -39,13 +37,11 @@ USER_AGENT = (
 
 
 @dataclass(frozen=True)
-class CheckResult:
-    status: str  # "IN_STOCK" | "OUT_OF_STOCK" | "UNKNOWN"
-    detail: str
-    checked_at: str
-
-    def to_dict(self) -> dict:
-        return {"status": self.status, "detail": self.detail, "checked_at": self.checked_at}
+class VariantStatus:
+    name: str       # full name from DOM, e.g. "X100VI Silver"
+    short: str      # Korean label, e.g. "실버"
+    in_stock: bool
+    price: str      # raw price text or "품절"
 
 
 def now_iso() -> str:
@@ -65,34 +61,43 @@ def save_state(path: Path, state: dict) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def classify(page: Page) -> CheckResult:
-    """Best-effort stock classification from rendered DOM.
+def short_label(full_name: str) -> str:
+    lower = full_name.lower()
+    if "silver" in lower:
+        return "실버"
+    if "black" in lower:
+        return "블랙"
+    return full_name
 
-    Strategy:
-        1. If any OUT keyword is visible in the buy area -> OUT_OF_STOCK.
-        2. Else if a buy/cart button exists and is enabled -> IN_STOCK.
-        3. Else UNKNOWN (treated as OUT to avoid false alerts).
+
+def classify_variants(page: Page) -> list[VariantStatus]:
+    """Read each color variant's stock state from the buy panel.
+
+    Each variant is rendered as `.selected-product__item` with a
+    `data-soldout="true|false"` attribute that we trust as the source of
+    truth. We also capture the visible price text so the alert can show
+    the actual price.
     """
-    body_text = page.locator("body").inner_text(timeout=5000)
+    items = page.locator(".selected-product__item")
+    count = items.count()
+    if count == 0:
+        raise RuntimeError("no .selected-product__item elements found")
 
-    out_hits = [kw for kw in OUT_OF_STOCK_KEYWORDS if kw in body_text]
-    if out_hits:
-        return CheckResult("OUT_OF_STOCK", f"keywords={out_hits}", now_iso())
-
-    for keyword in IN_STOCK_BUTTON_KEYWORDS:
-        candidates = page.get_by_text(keyword, exact=False)
-        count = candidates.count()
-        for index in range(count):
-            button = candidates.nth(index)
-            try:
-                if button.is_visible() and button.is_enabled():
-                    return CheckResult(
-                        "IN_STOCK", f"button='{keyword}' enabled", now_iso()
-                    )
-            except Exception:
-                continue
-
-    return CheckResult("UNKNOWN", "no decisive signal", now_iso())
+    results: list[VariantStatus] = []
+    for index in range(count):
+        item = items.nth(index)
+        soldout_attr = (item.get_attribute("data-soldout") or "").strip().lower()
+        name = (item.locator(".selected-product__name").text_content() or "").strip()
+        price = (item.locator(".selected-product__price").text_content() or "").strip()
+        results.append(
+            VariantStatus(
+                name=name,
+                short=short_label(name),
+                in_stock=soldout_attr != "true",
+                price=price,
+            )
+        )
+    return results
 
 
 def dump_debug(page: Page, dump_dir: Path) -> None:
@@ -105,7 +110,7 @@ def dump_debug(page: Page, dump_dir: Path) -> None:
     print(f"[debug] dumped {html_path} and {png_path}", file=sys.stderr)
 
 
-def fetch(url: str, debug_dir: Path | None) -> CheckResult:
+def fetch(url: str, debug_dir: Path | None) -> list[VariantStatus]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -117,18 +122,17 @@ def fetch(url: str, debug_dir: Path | None) -> CheckResult:
         try:
             page.goto(url, wait_until="networkidle", timeout=45_000)
         except PlaywrightTimeoutError:
-            # Fall back to a looser wait - the page may keep firing analytics.
             page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             page.wait_for_timeout(3_000)
 
-        result = classify(page)
+        results = classify_variants(page)
 
         if debug_dir is not None:
             dump_debug(page, debug_dir)
 
         context.close()
         browser.close()
-        return result
+        return results
 
 
 def should_send_heartbeat(previous: dict, hours: int) -> bool:
@@ -145,6 +149,39 @@ def should_send_heartbeat(previous: dict, hours: int) -> bool:
     return elapsed >= hours * 3600
 
 
+def compose_alert(newly_in_stock: list[VariantStatus],
+                  all_variants: list[VariantStatus],
+                  checked_at: str) -> str:
+    if len(newly_in_stock) == 1:
+        head = f"🔥 <b>X100VI {newly_in_stock[0].short} 재고 입고!</b>"
+    else:
+        labels = "/".join(v.short for v in newly_in_stock)
+        head = f"🔥 <b>X100VI {labels} 재고 입고!</b>"
+
+    detail_lines = []
+    for v in all_variants:
+        mark = "✅" if v.in_stock else "❌"
+        detail_lines.append(f"{mark} <b>{v.short}</b> — {v.price}")
+
+    return (
+        f"{head}\n"
+        "지금 바로 결제하세요. 보통 5~10분 안에 다시 품절됩니다.\n\n"
+        + "\n".join(detail_lines)
+        + f"\n\n<i>감지: {checked_at} UTC</i>"
+    )
+
+
+def detect_transitions(previous_variants: dict,
+                       current: list[VariantStatus]) -> list[VariantStatus]:
+    transitions: list[VariantStatus] = []
+    for variant in current:
+        prev = previous_variants.get(variant.name) or {}
+        was_in_stock = bool(prev.get("in_stock", False))
+        if variant.in_stock and not was_in_stock:
+            transitions.append(variant)
+    return transitions
+
+
 def main() -> int:
     url = os.environ.get("PRODUCT_URL", DEFAULT_URL)
     state_path = Path(os.environ.get("STATE_PATH", DEFAULT_STATE_PATH))
@@ -153,21 +190,21 @@ def main() -> int:
     heartbeat_hours = int(os.environ.get("HEARTBEAT_HOURS", "0"))
 
     previous = load_previous_state(state_path)
-    previous_status = previous.get("status", "UNKNOWN")
+    previous_variants: dict = previous.get("variants", {})
 
     attempts = 3
     last_error: Exception | None = None
-    result: CheckResult | None = None
+    variants: list[VariantStatus] | None = None
     for attempt in range(1, attempts + 1):
         try:
-            result = fetch(url, debug_dir if attempt == 1 else None)
+            variants = fetch(url, debug_dir if attempt == 1 else None)
             break
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             print(f"[warn] attempt {attempt}/{attempts} failed: {exc}", file=sys.stderr)
             time.sleep(5 * attempt)
 
-    if result is None:
+    if variants is None:
         message = (
             "⚠️ <b>재고 확인 실패</b>\n"
             f"3회 시도 모두 실패했습니다.\n<code>{last_error}</code>"
@@ -178,35 +215,33 @@ def main() -> int:
             print(f"[warn] failed to notify error: {exc}", file=sys.stderr)
         return 1
 
-    print(f"[info] status={result.status} detail={result.detail}")
+    checked_at = now_iso()
+    for variant in variants:
+        print(f"[info] {variant.name} in_stock={variant.in_stock} price='{variant.price}'")
 
-    transitioned_to_in_stock = (
-        result.status == "IN_STOCK" and previous_status != "IN_STOCK"
-    )
+    transitions = detect_transitions(previous_variants, variants)
 
     new_state = {
-        "status": result.status,
-        "detail": result.detail,
-        "checked_at": result.checked_at,
+        "checked_at": checked_at,
         "last_heartbeat_at": previous.get("last_heartbeat_at"),
+        "variants": {variant.name: asdict(variant) for variant in variants},
     }
 
-    if transitioned_to_in_stock:
-        message = (
-            "🔥 <b>X100VI 재고 입고!</b>\n"
-            "지금 바로 결제하세요. 보통 5~10분 안에 다시 품절됩니다.\n\n"
-            f"<i>감지: {result.checked_at} UTC</i>"
-        )
+    if transitions:
+        message = compose_alert(transitions, variants, checked_at)
         notify.send(message, product_url=url)
-        new_state["last_alerted_at"] = result.checked_at
+        new_state["last_alerted_at"] = checked_at
 
     if should_send_heartbeat(previous, heartbeat_hours):
+        summary = ", ".join(
+            f"{v.short}={'IN' if v.in_stock else 'OUT'}" for v in variants
+        )
         notify.send(
-            f"💤 모니터 정상 작동 중 ({result.status})",
+            f"💤 모니터 정상 작동 중 ({summary})",
             product_url=url,
             silent=True,
         )
-        new_state["last_heartbeat_at"] = result.checked_at
+        new_state["last_heartbeat_at"] = checked_at
 
     save_state(state_path, new_state)
     return 0
