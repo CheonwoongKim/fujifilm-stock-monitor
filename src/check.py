@@ -22,10 +22,12 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from typing import TYPE_CHECKING
 
 import notify
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 DEFAULT_URL = "https://www.fujifilm-korea.co.kr/products/id/1330"
 DEFAULT_STATE_PATH = "state.json"
@@ -111,6 +113,8 @@ def dump_debug(page: Page, dump_dir: Path) -> None:
 
 
 def fetch(url: str, debug_dir: Path | None) -> list[VariantStatus]:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
