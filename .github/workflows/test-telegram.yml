@@ -1,23 +1,32 @@
 name: test-telegram
 
-# Manual-only smoke test: sends a single Telegram message using the
-# configured secrets. Use this to verify that TELEGRAM_BOT_TOKEN and
-# TELEGRAM_CHAT_ID are wired up correctly without running the full
-# stock checker.
+# Manual-only smoke test. Sends the production-format stock alert to
+# Telegram so you can preview exactly what arrives when an actual
+# restock is detected.
 
 on:
   workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Which restock scenario to preview"
+        type: choice
+        options:
+          - silver
+          - black
+          - both
+        default: silver
 
 permissions:
   contents: read
 
 jobs:
-  ping:
+  send-sample:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SAMPLE_SCENARIO: ${{ inputs.scenario }}
     steps:
       - uses: actions/checkout@v4
 
@@ -26,9 +35,9 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install httpx
+      - name: Install dependencies
         run: pip install httpx==0.27.2
 
-      - name: Send test message
+      - name: Send sample alert
         working-directory: src
-        run: python notify.py
+        run: python send_sample_alert.py
