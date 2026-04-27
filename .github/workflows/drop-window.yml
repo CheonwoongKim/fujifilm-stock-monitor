@@ -1,0 +1,107 @@
+name: stock-monitor-drop-window
+
+# Polls only during the daily restock window 09:50–10:10 KST (20 minutes).
+# Triggered at 00:50 UTC (= 09:50 KST). The job loops internally for
+# ~20 minutes checking every 60 seconds, which is far below the 5-minute
+# minimum granularity of GitHub Actions cron.
+
+on:
+  schedule:
+    - cron: "50 0 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How long to keep polling (minutes)"
+        type: number
+        default: 20
+      interval_seconds:
+        description: "Seconds between checks"
+        type: number
+        default: 60
+      debug_dump:
+        description: "Upload rendered HTML/screenshot as artifact (first poll only)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: stock-monitor-drop-window
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  dense-poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PRODUCT_URL: https://www.fujifilm-korea.co.kr/products/id/1330
+      STATE_PATH: ${{ github.workspace }}/state.json
+      HEARTBEAT_HOURS: "0"
+      DURATION_MINUTES: ${{ inputs.duration_minutes || 20 }}
+      INTERVAL_SECONDS: ${{ inputs.interval_seconds || 60 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Restore stock state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: stock-state-v1-${{ github.run_id }}
+          restore-keys: |
+            stock-state-v1-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Set debug dump dir
+        if: ${{ inputs.debug_dump }}
+        run: echo "DEBUG_DUMP_DIR=${{ github.workspace }}/debug" >> "$GITHUB_ENV"
+
+      - name: Dense poll loop
+        working-directory: src
+        run: |
+          set -u
+          end_epoch=$(( $(date +%s) + DURATION_MINUTES * 60 ))
+          attempt=0
+          while [ "$(date +%s)" -lt "$end_epoch" ]; do
+            attempt=$((attempt + 1))
+            echo "::group::poll #$attempt $(date -u +%FT%TZ)"
+            python check.py || echo "[warn] check failed, continuing"
+            echo "::endgroup::"
+            # Only dump on the first poll to keep artifact small.
+            unset DEBUG_DUMP_DIR
+            remaining=$(( end_epoch - $(date +%s) ))
+            if [ "$remaining" -le "$INTERVAL_SECONDS" ]; then
+              break
+            fi
+            sleep "$INTERVAL_SECONDS"
+          done
+          echo "completed $attempt polls"
+
+      - name: Save stock state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: stock-state-v1-${{ github.run_id }}
+
+      - name: Upload debug dump
+        if: ${{ inputs.debug_dump }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 7
