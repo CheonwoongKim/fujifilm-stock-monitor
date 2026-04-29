@@ -48,7 +48,7 @@ class SendCycleSummaryTests(unittest.TestCase):
                         "last_checked_at": "2026-04-29T01:10:00+00:00",
                         "checks": 20,
                         "saw_any_in_stock": False,
-                        "alerts_sent": 0,
+                        "transitions_detected": 0,
                         "latest_variants": [
                             {"short": "실버", "in_stock": False},
                             {"short": "블랙", "in_stock": False},
@@ -98,7 +98,7 @@ class SendCycleSummaryTests(unittest.TestCase):
                         "last_checked_at": "2026-04-29T01:10:00+00:00",
                         "checks": 20,
                         "saw_any_in_stock": True,
-                        "alerts_sent": 0,
+                        "transitions_detected": 0,
                         "latest_variants": [
                             {"short": "실버", "in_stock": True},
                             {"short": "블랙", "in_stock": False},

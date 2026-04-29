@@ -58,7 +58,7 @@ class CheckLogicTests(unittest.TestCase):
             self.assertEqual(saved["last_checked_at"], "2026-04-29T00:51:00+00:00")
             self.assertEqual(saved["checks"], 2)
             self.assertTrue(saved["saw_any_in_stock"])
-            self.assertEqual(saved["alerts_sent"], 1)
+            self.assertEqual(saved["transitions_detected"], 1)
             self.assertEqual(saved["alerted_variants"], ["실버"])
 
 
@@ -118,7 +118,7 @@ class CheckMainTests(unittest.TestCase):
             cycle_state = json.loads(cycle_state_path.read_text(encoding="utf-8"))
             self.assertEqual(cycle_state["checks"], 1)
             self.assertTrue(cycle_state["saw_any_in_stock"])
-            self.assertEqual(cycle_state["alerts_sent"], 1)
+            self.assertEqual(cycle_state["transitions_detected"], 1)
 
     def test_main_records_cycle_state_even_when_alert_send_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -164,7 +164,7 @@ class CheckMainTests(unittest.TestCase):
             cycle_state = json.loads(cycle_state_path.read_text(encoding="utf-8"))
             self.assertEqual(cycle_state["checks"], 1)
             self.assertTrue(cycle_state["saw_any_in_stock"])
-            self.assertEqual(cycle_state["alerts_sent"], 1)
+            self.assertEqual(cycle_state["transitions_detected"], 1)
 
 
 if __name__ == "__main__":

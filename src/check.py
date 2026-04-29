@@ -47,6 +47,15 @@ class VariantStatus:
     price: str      # raw price text or "품절"
 
 
+@dataclass(frozen=True)
+class RuntimeConfig:
+    url: str
+    state_path: Path
+    cycle_state_path: Path | None
+    debug_dir: Path | None
+    heartbeat_hours: int
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -77,7 +86,7 @@ def update_cycle_state(path: Path | None,
     saw_any_in_stock = bool(existing.get("saw_any_in_stock", False)) or any(
         variant.in_stock for variant in variants
     )
-    alerts_sent = int(existing.get("alerts_sent", 0)) + (1 if transitions else 0)
+    transitions_detected = int(existing.get("transitions_detected", 0)) + len(transitions)
     alerted_variants = set(existing.get("alerted_variants", []))
     alerted_variants.update(variant.short for variant in transitions)
 
@@ -86,7 +95,7 @@ def update_cycle_state(path: Path | None,
         "last_checked_at": checked_at,
         "checks": checks,
         "saw_any_in_stock": saw_any_in_stock,
-        "alerts_sent": alerts_sent,
+        "transitions_detected": transitions_detected,
         "alerted_variants": sorted(alerted_variants),
         "latest_variants": [asdict(variant) for variant in variants],
     }
@@ -183,6 +192,16 @@ def should_send_heartbeat(previous: dict, hours: int) -> bool:
     return elapsed >= hours * 3600
 
 
+def build_variant_snapshot(variants: list[VariantStatus]) -> dict[str, dict]:
+    return {variant.name: asdict(variant) for variant in variants}
+
+
+def build_variant_status_summary(variants: list[VariantStatus]) -> str:
+    return ", ".join(
+        f"{variant.short}={'IN' if variant.in_stock else 'OUT'}" for variant in variants
+    )
+
+
 def compose_alert(newly_in_stock: list[VariantStatus],
                   all_variants: list[VariantStatus],
                   checked_at: str) -> str:
@@ -216,39 +235,52 @@ def detect_transitions(previous_variants: dict,
     return transitions
 
 
-def main() -> int:
-    url = os.environ.get("PRODUCT_URL", DEFAULT_URL)
+def load_runtime_config() -> RuntimeConfig:
     state_path = Path(os.environ.get("STATE_PATH", DEFAULT_STATE_PATH))
     cycle_state_env = os.environ.get("CYCLE_STATE_PATH")
-    cycle_state_path = Path(cycle_state_env) if cycle_state_env else None
     debug_dir_env = os.environ.get("DEBUG_DUMP_DIR")
-    debug_dir = Path(debug_dir_env) if debug_dir_env else None
-    heartbeat_hours = int(os.environ.get("HEARTBEAT_HOURS", "0"))
+    return RuntimeConfig(
+        url=os.environ.get("PRODUCT_URL", DEFAULT_URL),
+        state_path=state_path,
+        cycle_state_path=Path(cycle_state_env) if cycle_state_env else None,
+        debug_dir=Path(debug_dir_env) if debug_dir_env else None,
+        heartbeat_hours=int(os.environ.get("HEARTBEAT_HOURS", "0")),
+    )
 
-    previous = load_previous_state(state_path)
-    previous_variants: dict = previous.get("variants", {})
 
-    attempts = 3
+def fetch_with_retries(url: str, debug_dir: Path | None, attempts: int = 3) -> list[VariantStatus]:
     last_error: Exception | None = None
-    variants: list[VariantStatus] | None = None
     for attempt in range(1, attempts + 1):
         try:
-            variants = fetch(url, debug_dir if attempt == 1 else None)
-            break
+            return fetch(url, debug_dir if attempt == 1 else None)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             print(f"[warn] attempt {attempt}/{attempts} failed: {exc}", file=sys.stderr)
             time.sleep(5 * attempt)
+    reason = f"{type(last_error).__name__}: {last_error}" if last_error else "unknown error"
+    raise RuntimeError(f"failed to fetch variants after {attempts} attempts; last error: {reason}") from last_error
 
-    if variants is None:
-        message = (
-            "⚠️ <b>재고 확인 실패</b>\n"
-            f"3회 시도 모두 실패했습니다.\n<code>{last_error}</code>"
-        )
-        try:
-            notify.send(message, product_url=url, silent=True)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[warn] failed to notify error: {exc}", file=sys.stderr)
+
+def notify_check_failure(url: str, error: Exception) -> None:
+    message = (
+        "⚠️ <b>재고 확인 실패</b>\n"
+        f"3회 시도 모두 실패했습니다.\n<code>{error}</code>"
+    )
+    try:
+        notify.send(message, product_url=url, silent=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] failed to notify error: {exc}", file=sys.stderr)
+
+
+def main() -> int:
+    config = load_runtime_config()
+    previous = load_previous_state(config.state_path)
+    previous_variants: dict = previous.get("variants", {})
+
+    try:
+        variants = fetch_with_retries(config.url, config.debug_dir)
+    except Exception as exc:  # noqa: BLE001
+        notify_check_failure(config.url, exc)
         return 1
 
     checked_at = now_iso()
@@ -260,14 +292,14 @@ def main() -> int:
     new_state = {
         "checked_at": checked_at,
         "last_heartbeat_at": previous.get("last_heartbeat_at"),
-        "variants": {variant.name: asdict(variant) for variant in variants},
+        "variants": build_variant_snapshot(variants),
     }
 
     # Record that this poll actually happened before any outbound notification.
     # If Telegram is temporarily unavailable, we still want the end-of-cycle
     # summary to reflect real poll activity, and the next poll can retry alerts.
     update_cycle_state(
-        cycle_state_path,
+        config.cycle_state_path,
         checked_at=checked_at,
         variants=variants,
         transitions=transitions,
@@ -275,21 +307,18 @@ def main() -> int:
 
     if transitions:
         message = compose_alert(transitions, variants, checked_at)
-        notify.send(message, product_url=url)
+        notify.send(message, product_url=config.url)
         new_state["last_alerted_at"] = checked_at
 
-    if should_send_heartbeat(previous, heartbeat_hours):
-        summary = ", ".join(
-            f"{v.short}={'IN' if v.in_stock else 'OUT'}" for v in variants
-        )
+    if should_send_heartbeat(previous, config.heartbeat_hours):
         notify.send(
-            f"💤 모니터 정상 작동 중 ({summary})",
-            product_url=url,
+            f"💤 모니터 정상 작동 중 ({build_variant_status_summary(variants)})",
+            product_url=config.url,
             silent=True,
         )
         new_state["last_heartbeat_at"] = checked_at
 
-    save_state(state_path, new_state)
+    save_state(config.state_path, new_state)
     return 0
 
 
