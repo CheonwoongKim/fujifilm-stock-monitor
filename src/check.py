@@ -8,6 +8,7 @@ is available so the user can jump straight to checkout.
 Environment variables:
     PRODUCT_URL          target product page (default: X100VI page id 1330)
     STATE_PATH           path to state.json (default: ./state.json)
+    CYCLE_STATE_PATH     path to per-run cycle state json (optional)
     DEBUG_DUMP_DIR       if set, render dumps go here (HTML + screenshot)
     HEARTBEAT_HOURS      send a "still alive" silent ping every N hours (default: 0 = off)
     TELEGRAM_BOT_TOKEN   required for notifications
@@ -61,6 +62,35 @@ def load_previous_state(path: Path) -> dict:
 
 def save_state(path: Path, state: dict) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def update_cycle_state(path: Path | None,
+                       *,
+                       checked_at: str,
+                       variants: list[VariantStatus],
+                       transitions: list[VariantStatus]) -> None:
+    if path is None:
+        return
+
+    existing = load_previous_state(path)
+    checks = int(existing.get("checks", 0)) + 1
+    saw_any_in_stock = bool(existing.get("saw_any_in_stock", False)) or any(
+        variant.in_stock for variant in variants
+    )
+    alerts_sent = int(existing.get("alerts_sent", 0)) + (1 if transitions else 0)
+    alerted_variants = set(existing.get("alerted_variants", []))
+    alerted_variants.update(variant.short for variant in transitions)
+
+    cycle_state = {
+        "started_at": existing.get("started_at") or checked_at,
+        "last_checked_at": checked_at,
+        "checks": checks,
+        "saw_any_in_stock": saw_any_in_stock,
+        "alerts_sent": alerts_sent,
+        "alerted_variants": sorted(alerted_variants),
+        "latest_variants": [asdict(variant) for variant in variants],
+    }
+    save_state(path, cycle_state)
 
 
 def short_label(full_name: str) -> str:
@@ -189,6 +219,8 @@ def detect_transitions(previous_variants: dict,
 def main() -> int:
     url = os.environ.get("PRODUCT_URL", DEFAULT_URL)
     state_path = Path(os.environ.get("STATE_PATH", DEFAULT_STATE_PATH))
+    cycle_state_env = os.environ.get("CYCLE_STATE_PATH")
+    cycle_state_path = Path(cycle_state_env) if cycle_state_env else None
     debug_dir_env = os.environ.get("DEBUG_DUMP_DIR")
     debug_dir = Path(debug_dir_env) if debug_dir_env else None
     heartbeat_hours = int(os.environ.get("HEARTBEAT_HOURS", "0"))
@@ -248,6 +280,12 @@ def main() -> int:
         new_state["last_heartbeat_at"] = checked_at
 
     save_state(state_path, new_state)
+    update_cycle_state(
+        cycle_state_path,
+        checked_at=checked_at,
+        variants=variants,
+        transitions=transitions,
+    )
     return 0
 
 

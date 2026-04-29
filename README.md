@@ -10,13 +10,17 @@
 
 | 워크플로우 | 트리거 (UTC) | 트리거 (KST) | 실행 시간 | 폴링 간격 |
 |---|---|---|---|---|
-| `drop-window.yml` | 매일 `00:50` | 매일 `09:50` | 20분 | 1분 |
+| `drop-window.yml` | 매일 `00:35, 00:40, 00:45, 00:50, 00:55, 01:00, 01:05` + 선택적 외부 API 트리거 | 매일 `09:35~10:05` 백업 트리거 후 실제 폴링은 `09:50~10:10`에만 수행 | 최대 20분 | 1분 |
 
-- 매일 09:50 KST에 한 번만 가동 → 20번 폴링 후 자동 종료 (10:10경)
+- 워크플로우가 일찍 시작되면 **09:50 KST까지 대기** 후 폴링 시작
+- 워크플로우가 09:50~10:10 KST 사이에 늦게 시작되면 **남은 시간만큼만 폴링**
+- 워크플로우가 10:10 KST 이후에 시작되면 **그날은 폴링 없이 종료**
 - 상태(state.json)는 GitHub Actions 캐시로 보존, **OUT → IN 전이 시에만** 알림 (스팸 방지)
 - 입고가 감지되면 폴링 중에도 즉시 텔레그램 푸시 발송
+- 매일 사이클 종료 시점에 **종료 요약 텔레그램 메시지** 발송
+- 10:10 KST까지 재고가 없으면 종료 요약에 **무재고 종료**가 명시됨
 
-> GitHub Actions cron은 부하 시 수 분 지연될 수 있습니다. 09:50 정각이 절대 보장되지는 않으므로, 더 안전하게 하려면 cron을 `45 0 * * *` (09:45 KST)로 앞당기고 `duration_minutes`를 25~30으로 늘리면 됩니다.
+> GitHub Actions `schedule`은 부하 시 지연될 수 있습니다. 이 저장소는 백업 cron 여러 개를 두고 윈도우 시작 전에는 대기하도록 바꿨지만, `09:50 정각 시작`을 강하게 원하면 외부 스케줄러가 GitHub API로 `repository_dispatch`를 호출하는 구성이 가장 정확합니다.
 
 ---
 
@@ -85,7 +89,29 @@ gh repo create fujifilm-stock-monitor --public --source=. --push
 
 ## 5단계. 가동 확인
 
-다음날 09:50 KST 직후 Actions 탭에서 `stock-monitor-drop-window`가 자동 실행되어 약 20분 동안 돌고 ✅로 끝나는지 확인하세요.
+다음날 09:50 KST 전후로 Actions 탭에서 `stock-monitor-drop-window`가 자동 실행되고, 약 10:10 KST까지 폴링 후 ✅로 끝나는지 확인하세요.
+
+---
+
+## 선택사항. 정확한 09:50 시작을 위한 외부 트리거
+
+GitHub cron 지연을 더 줄이려면 외부 스케줄러에서 아래 API를 매일 **09:48 KST**에 호출하세요.
+
+- URL: `POST /repos/{owner}/{repo}/dispatches`
+- 이벤트 타입: `stock-monitor-window`
+
+예시:
+
+```bash
+curl -L \
+  -X POST \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer <GITHUB_TOKEN>" \
+  https://api.github.com/repos/<owner>/<repo>/dispatches \
+  -d '{"event_type":"stock-monitor-window"}'
+```
+
+이 방식이면 워크플로우가 09:48쯤 시작해서 내부에서 09:50까지 대기한 뒤, 09:50~10:10 KST 윈도우만 정확히 폴링합니다.
 
 ---
 
@@ -95,7 +121,7 @@ gh repo create fujifilm-stock-monitor --public --source=. --push
 |---|---|
 | 알림이 한 번도 안 옴 | 입고 자체가 없었거나, 분류 로직이 IN을 못 잡았을 가능성. `debug_dump`로 HTML 확인 후 키워드 조정 |
 | `UNKNOWN` 상태가 자주 찍힘 | 페이지 로드 실패 또는 셀렉터 미스. 디버그 dump → `IN_STOCK_BUTTON_KEYWORDS`에 실제 버튼 텍스트 추가 |
-| 09:50에 시작 안 함 | GitHub cron은 부하 시 수 분~십수 분 지연 가능. cron을 `45 0`로 당기고 `duration_minutes`를 25~30으로 늘려 안전 마진 확보 |
+| 09:50에 시작 안 함 | GitHub cron은 부하 시 지연 가능. 현재는 여러 백업 cron + 윈도우 대기 로직이 들어가 있음. 더 정확히 맞추려면 외부 스케줄러에서 `repository_dispatch` 호출 |
 | 알림이 폭주함 | 첫날만 그럴 수 있음 (이전 상태 캐시 없음). 둘째 날부터 OUT→IN 전이 시에만 1회 |
 
 ---
@@ -108,7 +134,8 @@ gh repo create fujifilm-stock-monitor --public --source=. --push
 │   └── drop-window.yml      # 09:50 KST 시작, 20분 1분 간격 폴링
 ├── src/
 │   ├── check.py             # 페이지 확인 + 상태 비교 + 알림 트리거
-│   └── notify.py            # 텔레그램 sendMessage 래퍼
+│   ├── notify.py            # 텔레그램 sendMessage 래퍼
+│   └── send_cycle_summary.py # 종료 요약 텔레그램 발송
 ├── requirements.txt
 ├── .gitignore
 └── README.md

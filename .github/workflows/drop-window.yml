@@ -1,13 +1,21 @@
 name: stock-monitor-drop-window
 
-# Polls only during the daily restock window 09:50–10:10 KST (20 minutes).
-# Triggered at 00:50 UTC (= 09:50 KST). The job loops internally for
-# ~20 minutes checking every 60 seconds, which is far below the 5-minute
-# minimum granularity of GitHub Actions cron.
+# Polls only during the daily restock window 09:50–10:10 KST.
+# GitHub Actions schedule can be delayed under load, so this workflow:
+# - accepts an exact external trigger via repository_dispatch
+# - keeps several backup schedule entries before the window
+# - waits until 09:50 KST if it starts early
+# - exits without polling if it starts after 10:10 KST
 
 on:
   schedule:
+    - cron: "35 0 * * *"
+    - cron: "40 0 * * *"
+    - cron: "45 0 * * *"
     - cron: "50 0 * * *"
+    - cron: "55 0 * * *"
+    - cron: "0 1 * * *"
+    - cron: "5 1 * * *"
   workflow_dispatch:
     inputs:
       duration_minutes:
@@ -22,6 +30,9 @@ on:
         description: "Upload rendered HTML/screenshot as artifact (first poll only)"
         type: boolean
         default: false
+  repository_dispatch:
+    types:
+      - stock-monitor-window
 
 concurrency:
   group: stock-monitor-drop-window
@@ -40,9 +51,16 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       PRODUCT_URL: https://www.fujifilm-korea.co.kr/products/id/1330
       STATE_PATH: ${{ github.workspace }}/state.json
+      CYCLE_STATE_PATH: ${{ github.workspace }}/cycle-state.json
       HEARTBEAT_HOURS: "0"
       DURATION_MINUTES: ${{ inputs.duration_minutes || 20 }}
       INTERVAL_SECONDS: ${{ inputs.interval_seconds || 60 }}
+      WINDOW_TIMEZONE: Asia/Seoul
+      WINDOW_START_HOUR: "9"
+      WINDOW_START_MINUTE: "50"
+      WINDOW_END_HOUR: "10"
+      WINDOW_END_MINUTE: "10"
+      WINDOW_LABEL: 09:50~10:10 KST
     steps:
       - uses: actions/checkout@v4
 
@@ -69,7 +87,57 @@ jobs:
         if: ${{ inputs.debug_dump }}
         run: echo "DEBUG_DUMP_DIR=${{ github.workspace }}/debug" >> "$GITHUB_ENV"
 
+      - name: Initialize cycle state
+        run: |
+          rm -f "$CYCLE_STATE_PATH"
+          echo "CYCLE_END_REASON=completed" >> "$GITHUB_ENV"
+
+      - name: Align to drop window
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        run: |
+          set -eu
+          python - <<'PY'
+          import os
+          import time
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          tz = ZoneInfo(os.environ["WINDOW_TIMEZONE"])
+          now = datetime.now(tz)
+          start = now.replace(
+              hour=int(os.environ["WINDOW_START_HOUR"]),
+              minute=int(os.environ["WINDOW_START_MINUTE"]),
+              second=0,
+              microsecond=0,
+          )
+          end = now.replace(
+              hour=int(os.environ["WINDOW_END_HOUR"]),
+              minute=int(os.environ["WINDOW_END_MINUTE"]),
+              second=0,
+              microsecond=0,
+          )
+          if end <= start:
+              end += timedelta(days=1)
+          if now >= end:
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+                  fh.write("SKIP_DENSE_POLL=1\n")
+                  fh.write("CYCLE_END_REASON=started_after_window\n")
+              print(f"[info] current time {now.isoformat()} is after window end {end.isoformat()}; skipping")
+              raise SystemExit(0)
+          if now < start:
+              wait_seconds = int((start - now).total_seconds())
+              print(f"[info] current time {now.isoformat()} is before window start {start.isoformat()}; sleeping {wait_seconds}s")
+              time.sleep(wait_seconds)
+          else:
+              print(f"[info] current time {now.isoformat()} is already inside window ending {end.isoformat()}")
+          remaining_minutes = max(1, int((end - datetime.now(tz)).total_seconds() // 60))
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              fh.write(f"DURATION_MINUTES={remaining_minutes}\n")
+          print(f"[info] dense polling duration set to {remaining_minutes} minute(s)")
+          PY
+
       - name: Dense poll loop
+        if: ${{ env.SKIP_DENSE_POLL != '1' }}
         working-directory: src
         run: |
           set -u
@@ -96,6 +164,11 @@ jobs:
         with:
           path: state.json
           key: stock-state-v1-${{ github.run_id }}
+
+      - name: Send cycle summary
+        if: always()
+        working-directory: src
+        run: python send_cycle_summary.py
 
       - name: Upload debug dump
         if: ${{ inputs.debug_dump }}
