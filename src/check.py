@@ -263,6 +263,16 @@ def main() -> int:
         "variants": {variant.name: asdict(variant) for variant in variants},
     }
 
+    # Record that this poll actually happened before any outbound notification.
+    # If Telegram is temporarily unavailable, we still want the end-of-cycle
+    # summary to reflect real poll activity, and the next poll can retry alerts.
+    update_cycle_state(
+        cycle_state_path,
+        checked_at=checked_at,
+        variants=variants,
+        transitions=transitions,
+    )
+
     if transitions:
         message = compose_alert(transitions, variants, checked_at)
         notify.send(message, product_url=url)
@@ -280,12 +290,6 @@ def main() -> int:
         new_state["last_heartbeat_at"] = checked_at
 
     save_state(state_path, new_state)
-    update_cycle_state(
-        cycle_state_path,
-        checked_at=checked_at,
-        variants=variants,
-        transitions=transitions,
-    )
     return 0
 
 

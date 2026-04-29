@@ -158,17 +158,17 @@ jobs:
           done
           echo "completed $attempt polls"
 
+      - name: Send cycle summary
+        if: always()
+        working-directory: src
+        run: python send_cycle_summary.py
+
       - name: Save stock state
         if: always()
         uses: actions/cache/save@v4
         with:
           path: state.json
           key: stock-state-v1-${{ github.run_id }}
-
-      - name: Send cycle summary
-        if: always()
-        working-directory: src
-        run: python send_cycle_summary.py
 
       - name: Upload debug dump
         if: ${{ inputs.debug_dump }}

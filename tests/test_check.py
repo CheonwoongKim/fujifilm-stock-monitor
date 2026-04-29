@@ -120,6 +120,52 @@ class CheckMainTests(unittest.TestCase):
             self.assertTrue(cycle_state["saw_any_in_stock"])
             self.assertEqual(cycle_state["alerts_sent"], 1)
 
+    def test_main_records_cycle_state_even_when_alert_send_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            cycle_state_path = Path(tmpdir) / "cycle-state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "variants": {
+                            "X100VI Silver": {
+                                "name": "X100VI Silver",
+                                "short": "실버",
+                                "in_stock": False,
+                                "price": "품절",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            variants = [
+                check.VariantStatus("X100VI Silver", "실버", True, "₩2,250,000"),
+            ]
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PRODUCT_URL": "https://example.com/product",
+                    "STATE_PATH": str(state_path),
+                    "CYCLE_STATE_PATH": str(cycle_state_path),
+                    "HEARTBEAT_HOURS": "0",
+                },
+                clear=False,
+            ):
+                with patch("check.fetch", return_value=variants), patch(
+                    "check.now_iso", return_value="2026-04-29T00:50:00+00:00"
+                ), patch(
+                    "check.notify.send", side_effect=RuntimeError("telegram down")
+                ):
+                    with self.assertRaises(RuntimeError):
+                        check.main()
+
+            cycle_state = json.loads(cycle_state_path.read_text(encoding="utf-8"))
+            self.assertEqual(cycle_state["checks"], 1)
+            self.assertTrue(cycle_state["saw_any_in_stock"])
+            self.assertEqual(cycle_state["alerts_sent"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
