@@ -1,8 +1,21 @@
 # Fujifilm X100VI 재고 모니터
 
-매일 **09:50~10:10 KST (20분)** 동안만 후지필름몰 X100VI 상품 페이지를 1분 간격으로 확인하고, **품절 → 입고 전이가 감지되는 순간 텔레그램으로 알림**을 보내는 GitHub Actions 봇입니다. 알림에는 상품 페이지 즉시 열기 버튼이 포함되어 있어 폰에서 곧바로 결제로 진입할 수 있습니다.
+매일 **09:50~10:10 KST** 동안 후지필름몰 X100VI 상품 페이지를 1분 간격으로 확인하고, **품절 → 입고 전이가 감지되는 순간 텔레그램으로 알림**을 보냅니다. 알림에는 상품 페이지 즉시 열기 버튼이 포함되어 있어 폰에서 곧바로 결제로 진입할 수 있습니다.
 
 > ⚠️ 본 도구는 **재고 알림 전용**입니다. 자동 결제는 포함되지 않습니다 (쇼핑몰 약관·결제 인증 단계 우회 리스크 때문). 알림을 받은 뒤 직접 빠르게 결제하세요.
+
+---
+
+## 두 가지 구현 (병렬 운영)
+
+| 구현 | 위치 | 트리거 정확도 | 상태 |
+|---|---|---|---|
+| **Cloudflare Worker** ⭐ | [`cloudflare/`](./cloudflare/) | 초 단위 정확 | **메인** |
+| GitHub Actions | [`.github/workflows/drop-window.yml`](./.github/workflows/drop-window.yml) | 수 시간 지연·드롭 가능 | 백업 (~1주일 후 비활성화 예정) |
+
+GitHub Actions cron의 신뢰성 이슈(예: 09:50 KST 예약 → 13:25 KST 실제 실행)를 회피하기 위해 Cloudflare Workers로 이전. 후지필름몰이 SSR로 `data-soldout`을 직접 노출하므로 Workers 무료 티어 + 단순 HTTP fetch만으로 동작 (Playwright 불필요).
+
+→ **Cloudflare 배포 가이드: [`cloudflare/README.md`](./cloudflare/README.md)**
 
 ---
 

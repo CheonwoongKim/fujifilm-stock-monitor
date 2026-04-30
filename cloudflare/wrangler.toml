@@ -1,0 +1,24 @@
+name = "fujifilm-stock-monitor"
+main = "src/worker.ts"
+compatibility_date = "2026-01-15"
+
+[vars]
+PRODUCT_URL = "https://www.fujifilm-korea.co.kr/products/id/1330"
+
+# 09:50–09:59 KST = 00:50–00:59 UTC  (10 fires)
+# 10:00–10:09 KST = 01:00–01:09 UTC  (10 fires)
+# Total: 20 invocations per day, 1-minute granularity.
+[triggers]
+crons = [
+  "50-59 0 * * *",
+  "0-9 1 * * *",
+]
+
+[[kv_namespaces]]
+binding = "STOCK_STATE"
+# Replace this id after running:
+#   wrangler kv:namespace create stock-state
+id = "REPLACE_AFTER_KV_CREATE"
+
+[observability]
+enabled = true
