@@ -9,6 +9,10 @@ name: stock-monitor-drop-window
 
 on:
   schedule:
+    - cron: "0 23 * * *"
+    - cron: "30 23 * * *"
+    - cron: "0 0 * * *"
+    - cron: "15 0 * * *"
     - cron: "35 0 * * *"
     - cron: "40 0 * * *"
     - cron: "45 0 * * *"
@@ -45,7 +49,7 @@ permissions:
 jobs:
   dense-poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 180
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
