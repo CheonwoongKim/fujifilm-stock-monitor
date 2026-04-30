@@ -56,8 +56,16 @@ export default {
       return jsonResponse({ cleared: true });
     }
 
+    if (url.pathname === "/test-telegram") {
+      const scenario = url.searchParams.get("scenario") ?? "silver";
+      const productUrl = env.PRODUCT_URL ?? DEFAULT_PRODUCT_URL;
+      const message = sampleAlert(scenario);
+      await sendTelegram(env, message, { productUrl });
+      return jsonResponse({ sent: true, scenario });
+    }
+
     return new Response(
-      "fujifilm stock monitor — try /check, /state, or /clear-state",
+      "fujifilm stock monitor — try /check, /state, /clear-state, /test-telegram?scenario=silver|black|both",
       { status: 200 },
     );
   },
@@ -134,6 +142,22 @@ function composeAlert(
     "",
     `<i>감지: ${checkedAt}</i>`,
   ].join("\n");
+}
+
+function sampleAlert(scenario: string): string {
+  const silverIn: Variant = { name: "X100VI Silver", short: "실버", inStock: true, price: "₩2,250,000" };
+  const silverOut: Variant = { name: "X100VI Silver", short: "실버", inStock: false, price: "품절" };
+  const blackIn: Variant = { name: "X100VI Black", short: "블랙", inStock: true, price: "₩2,250,000" };
+  const blackOut: Variant = { name: "X100VI Black", short: "블랙", inStock: false, price: "품절" };
+
+  let all: Variant[];
+  let newly: Variant[];
+  if (scenario === "black") { all = [silverOut, blackIn]; newly = [blackIn]; }
+  else if (scenario === "both") { all = [silverIn, blackIn]; newly = [silverIn, blackIn]; }
+  else { all = [silverIn, blackOut]; newly = [silverIn]; }
+
+  return "🧪 <b>[샘플]</b> Cloudflare Worker에서 발송한 테스트입니다.\n\n"
+    + composeAlert(newly, all, new Date().toISOString());
 }
 
 function jsonResponse(data: unknown): Response {
