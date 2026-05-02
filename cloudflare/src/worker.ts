@@ -9,6 +9,8 @@ export interface Env {
 }
 
 const STATE_KEY = "stock-state-v1";
+const LOG_KEY = "stock-log-v1";
+const LOG_MAX_ENTRIES = 100;
 const DEFAULT_PRODUCT_URL =
   "https://www.fujifilm-korea.co.kr/products/id/1330";
 const USER_AGENT =
@@ -27,28 +29,40 @@ interface PersistedState {
   variants: Record<string, Variant>;
 }
 
+interface LogEntry {
+  at: string;
+  source: "cron" | "manual";
+  silver: { inStock: boolean; price: string } | null;
+  black: { inStock: boolean; price: string } | null;
+  alerted: boolean;
+  error?: string;
+}
+
 export default {
   async scheduled(
-    _event: ScheduledController,
+    event: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    ctx.waitUntil(runCheck(env).then((result) => {
-      console.log("scheduled check", JSON.stringify(result));
-    }));
+    ctx.waitUntil(handleScheduled(event, env));
   },
 
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/check") {
-      const result = await runCheck(env);
+      const result = await runCheck(env, "manual");
       return jsonResponse(result);
     }
 
     if (url.pathname === "/state") {
       const state = await env.STOCK_STATE.get<PersistedState>(STATE_KEY, "json");
       return jsonResponse(state);
+    }
+
+    if (url.pathname === "/log") {
+      const log = (await env.STOCK_STATE.get<LogEntry[]>(LOG_KEY, "json")) ?? [];
+      return jsonResponse({ count: log.length, entries: log.slice().reverse() });
     }
 
     if (url.pathname === "/clear-state") {
@@ -65,60 +79,155 @@ export default {
     }
 
     return new Response(
-      "fujifilm stock monitor — try /check, /state, /clear-state, /test-telegram?scenario=silver|black|both",
+      "fujifilm stock monitor — try /check, /state, /log, /clear-state, /test-telegram?scenario=silver|black|both",
       { status: 200 },
     );
   },
 };
 
-async function runCheck(env: Env): Promise<CheckResult> {
+async function handleScheduled(
+  event: ScheduledController,
+  env: Env,
+): Promise<void> {
+  let result: CheckResult | null = null;
+  let errorMessage: string | undefined;
+  try {
+    result = await runCheck(env, "cron");
+  } catch (err) {
+    errorMessage = err instanceof Error ? err.message : String(err);
+    console.error("cron check failed", errorMessage);
+  }
+
+  const scheduledAt = new Date(event.scheduledTime);
+  const isLastCronOfWindow =
+    scheduledAt.getUTCHours() === 1 && scheduledAt.getUTCMinutes() === 9;
+
+  if (isLastCronOfWindow) {
+    try {
+      await sendDailySummary(env, scheduledAt, result, errorMessage);
+    } catch (err) {
+      console.error(
+        "failed to send daily summary",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+}
+
+async function appendLog(env: Env, entry: LogEntry): Promise<void> {
+  const existing =
+    (await env.STOCK_STATE.get<LogEntry[]>(LOG_KEY, "json")) ?? [];
+  const next = [...existing, entry].slice(-LOG_MAX_ENTRIES);
+  await env.STOCK_STATE.put(LOG_KEY, JSON.stringify(next));
+}
+
+async function sendDailySummary(
+  env: Env,
+  scheduledAt: Date,
+  result: CheckResult | null,
+  errorMessage: string | undefined,
+): Promise<void> {
   const productUrl = env.PRODUCT_URL ?? DEFAULT_PRODUCT_URL;
-  const response = await fetch(productUrl, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept-Language": "ko-KR,ko;q=0.9",
-      "Accept":
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    },
-    cf: { cacheEverything: false },
-  });
-  if (!response.ok) {
-    throw new Error(`fetch failed: ${response.status} ${response.statusText}`);
-  }
+  const dateLabel = formatKstDate(scheduledAt);
 
-  const html = await response.text();
-  const variants = parseVariants(html);
-  if (variants.length === 0) {
-    throw new Error(
-      "no variants found in HTML — selectors may have changed",
+  let body: string;
+  if (errorMessage) {
+    body = `⚠️ <b>${dateLabel} 모니터 오류</b>\n오늘 마지막 체크에서 실패: <code>${escapeHtml(errorMessage)}</code>`;
+  } else if (result === null) {
+    body = `⚠️ <b>${dateLabel} 모니터 오류</b>\n원인 불명의 실패`;
+  } else {
+    const lines = result.variants.map(
+      (v) => `${v.inStock ? "✅" : "❌"} <b>${v.short}</b> — ${v.price}`,
     );
+    body =
+      `💤 <b>${dateLabel} 모니터 정상 종료</b>\n` +
+      `09:50–10:09 KST 폴링 완료. OUT→IN 전이 없음.\n\n` +
+      lines.join("\n");
   }
 
-  const previous =
-    (await env.STOCK_STATE.get<PersistedState>(STATE_KEY, "json")) ??
-    { checkedAt: "", variants: {} };
+  await sendTelegram(env, body, { productUrl, silent: true });
+}
 
-  const transitions = variants.filter((v) => {
-    const wasInStock = previous.variants[v.name]?.inStock === true;
-    return v.inStock && !wasInStock;
-  });
+function formatKstDate(d: Date): string {
+  const kst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+  const yyyy = kst.getUTCFullYear();
+  const mm = String(kst.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(kst.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
 
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+async function runCheck(env: Env, source: "cron" | "manual"): Promise<CheckResult> {
+  const productUrl = env.PRODUCT_URL ?? DEFAULT_PRODUCT_URL;
   const checkedAt = new Date().toISOString();
-  let alerted = false;
+  try {
+    const response = await fetch(productUrl, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Accept":
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      },
+      cf: { cacheEverything: false },
+    });
+    if (!response.ok) {
+      throw new Error(`fetch failed: ${response.status} ${response.statusText}`);
+    }
 
-  if (transitions.length > 0) {
-    const message = composeAlert(transitions, variants, checkedAt);
-    await sendTelegram(env, message, { productUrl });
-    alerted = true;
+    const html = await response.text();
+    const variants = parseVariants(html);
+    if (variants.length === 0) {
+      throw new Error("no variants found in HTML — selectors may have changed");
+    }
+
+    const previous =
+      (await env.STOCK_STATE.get<PersistedState>(STATE_KEY, "json")) ??
+      { checkedAt: "", variants: {} };
+
+    const transitions = variants.filter((v) => {
+      const wasInStock = previous.variants[v.name]?.inStock === true;
+      return v.inStock && !wasInStock;
+    });
+
+    let alerted = false;
+    if (transitions.length > 0) {
+      const message = composeAlert(transitions, variants, checkedAt);
+      await sendTelegram(env, message, { productUrl });
+      alerted = true;
+    }
+
+    const newState: PersistedState = {
+      checkedAt,
+      variants: Object.fromEntries(variants.map((v) => [v.name, v])),
+    };
+    await env.STOCK_STATE.put(STATE_KEY, JSON.stringify(newState));
+
+    const silver = variants.find((v) => v.short === "실버");
+    const black = variants.find((v) => v.short === "블랙");
+    await appendLog(env, {
+      at: checkedAt,
+      source,
+      silver: silver ? { inStock: silver.inStock, price: silver.price } : null,
+      black: black ? { inStock: black.inStock, price: black.price } : null,
+      alerted,
+    });
+
+    return { checkedAt, variants, transitions, alerted };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await appendLog(env, {
+      at: checkedAt,
+      source,
+      silver: null,
+      black: null,
+      alerted: false,
+      error: message,
+    });
+    throw err;
   }
-
-  const newState: PersistedState = {
-    checkedAt,
-    variants: Object.fromEntries(variants.map((v) => [v.name, v])),
-  };
-  await env.STOCK_STATE.put(STATE_KEY, JSON.stringify(newState));
-
-  return { checkedAt, variants, transitions, alerted };
 }
 
 function composeAlert(
